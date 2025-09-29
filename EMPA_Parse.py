@@ -4,6 +4,10 @@ import json
 import argparse
 from collections import OrderedDict
 import pandas as pd
+import os
+import csv
+from pathlib import Path
+
 KV_RE = re.compile(r'^\s*([^:]+?)\s*:\s*(.*)$')
 
 def read_lines(path):
@@ -280,13 +284,191 @@ def parse_file(path):
             break
 
     return parsed
-# ...existing code...
+
+# Code for walking directories and writing to csv
+def _safe_name(s):
+    """Make a filename-safe string from a section name."""
+    return re.sub(r'[^0-9A-Za-z._-]+', '_', s).strip('_')
+
+def _is_primitive(v):
+    return isinstance(v, (str, int, float, bool)) or v is None
+
+def _write_section_csv_flat(section, rows, outpath):
+    """Write rows where each row is {'file':..., **keys} and keys set is known."""
+    fieldnames = ['file'] + sorted(k for k in rows[0].keys() if k != 'file')
+    with open(outpath, 'w', encoding='utf-8', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
+
+def _write_section_csv_json(section, rows, outpath):
+    """Write simple two-column CSV file + json value."""
+    with open(outpath, 'w', encoding='utf-8', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['file', 'value'])
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({'file': r['file'], 'value': r.get('value', '')})
+
+def walk_parse_and_export(root_dir, out_dir=None, exts=('.txt', '.qtidat', '.qtidat')):
+    """
+    Walk directories under root_dir, parse files with matching extensions,
+    and save CSVs. Produces wide (column-per-element) CSVs for:
+      - standard_by_element.csv  (file + one column per element -> standard name)
+      - xtal_by_element.csv      (file + one column per element -> xtal/crystal used)
+    Keeps a standard_compositions.csv (standard, element, value) as before.
+    Returns parsed_by_file dict.
+    """
+    import csv
+    import json
+    import re
+    from pathlib import Path
+
+    root = Path(root_dir)
+    if out_dir is None:
+        out_dir = root / 'parsed_csvs'
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    parsed_by_file = {}
+    for p in root.rglob('*'):
+        if p.is_file() and p.suffix.lower() in exts:
+            try:
+                parsed = parse_file(str(p))
+            except Exception as e:
+                print(f"Failed to parse {p}: {e}")
+                continue
+            parsed_by_file[str(p)] = parsed
+
+    # --- Build wide standard_by_element table ---
+    all_elements_for_standards = set()
+    file_to_element_standard = {}  # file -> { element: standard }
+    for fp, parsed in parsed_by_file.items():
+        file_to_element_standard[fp] = {}
+        # find the parsed standard-name structure regardless of exact key variant
+        sn_block = None
+        for k in parsed.keys():
+            if k.lower().startswith('standard name'):
+                sn_block = parsed[k]
+                break
+        if not sn_block:
+            # some files may have element_to_standard directly at top-level
+            if 'element_to_standard' in parsed and isinstance(parsed['element_to_standard'], dict):
+                sn_block = {'element_to_standard': parsed['element_to_standard']}
+        if sn_block and isinstance(sn_block, dict):
+            etos = sn_block.get('element_to_standard') or {}
+            for el, std in etos.items():
+                file_to_element_standard[fp][el] = std
+                all_elements_for_standards.add(el)
+
+    # write wide CSV for standards
+    std_fields = ['file'] + sorted(all_elements_for_standards)
+    with open(out_dir / 'standard_by_element.csv', 'w', encoding='utf-8', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=std_fields)
+        w.writeheader()
+        for fp in sorted(parsed_by_file.keys()):
+            row = {'file': fp}
+            esm = file_to_element_standard.get(fp, {})
+            for el in all_elements_for_standards:
+                row[el] = esm.get(el, '')
+            w.writerow(row)
+
+    # --- Build wide xtal_by_element table (best-effort from Analysis Parameters) ---
+    all_elements_for_xtal = set()
+    file_to_element_xtal = {}  # file -> { element: xtal }
+    for fp, parsed in parsed_by_file.items():
+        file_to_element_xtal[fp] = {}
+        ap_block = None
+        for k in parsed.keys():
+            if k.lower().startswith('analysis param'):
+                ap_block = parsed[k]
+                break
+        if not ap_block:
+            # also accept 'Analysis Parameters parsed' produced earlier
+            ap_block = parsed.get('Analysis Parameters parsed') or ap_block
+        if ap_block and isinstance(ap_block, list):
+            for row in ap_block:
+                element = None
+                xtal = None
+                for key, val in row.items():
+                    kl = key.lower()
+                    if kl in ('element', 'el', 'analyte', 'name'):
+                        element = val
+                    if 'xtal' in kl or 'cryst' in kl or 'crystal' in kl:
+                        xtal = val
+                # fallback: first non-empty column looks like element
+                if not element:
+                    for v in row.values():
+                        if v:
+                            element = v
+                            break
+                if element:
+                    file_to_element_xtal[fp][element] = xtal or ''
+                    all_elements_for_xtal.add(element)
+
+    xtal_fields = ['file'] + sorted(all_elements_for_xtal)
+    with open(out_dir / 'xtal_by_element.csv', 'w', encoding='utf-8', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=xtal_fields)
+        w.writeheader()
+        for fp in sorted(parsed_by_file.keys()):
+            row = {'file': fp}
+            emap = file_to_element_xtal.get(fp, {})
+            for el in all_elements_for_xtal:
+                row[el] = emap.get(el, '')
+            w.writerow(row)
+
+    # --- standard compositions (unchanged shape) ---
+    standard_compositions = {}
+    for fp, parsed in parsed_by_file.items():
+        sc_block = None
+        for k in parsed.keys():
+            if k.lower().startswith('standard composition'):
+                sc_block = parsed[k]
+                break
+        if sc_block:
+            std_map = {}
+            if isinstance(sc_block, dict) and 'standard_to_composition' in sc_block:
+                std_map = sc_block.get('standard_to_composition', {})
+            elif isinstance(sc_block, dict):
+                std_map = sc_block
+            for std, comps in std_map.items():
+                if isinstance(comps, dict):
+                    standard_compositions.setdefault(std, {}).update(comps)
+
+    std_comp_rows = []
+    for std, comps in standard_compositions.items():
+        for el, val in comps.items():
+            std_comp_rows.append({'standard': std, 'element': el, 'value': '' if val is None else val})
+    if std_comp_rows:
+        with open(out_dir / 'standard_compositions.csv', 'w', encoding='utf-8', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=['standard', 'element', 'value'])
+            w.writeheader()
+            for r in std_comp_rows:
+                w.writerow(r)
+
+    return parsed_by_file
 #%%
 def main():
     ap = argparse.ArgumentParser(description='Parse Camca EMPA header metadata to JSON.')
-    ap.add_argument('infile', help='path to .txt or .qtiDat file')
+    ap.add_argument('infile', nargs='?', help='path to .txt or .qtiDat file (file or directory)')
     ap.add_argument('-o','--out', help='output json file (defaults to stdout)')
+    ap.add_argument('--dir', action='store_true', help='treat infile as directory and export CSVs (creates parsed_csvs subdir by default)')
     args = ap.parse_args()
+
+    if args.dir:
+        if not args.infile:
+            ap.error('--dir requires an infile directory path')
+        parsed_map = walk_parse_and_export(args.infile)
+        # also optionally write a combined JSON summary
+        summary_path = Path(args.infile) / 'parsed_csvs' / 'parsed_summary.json'
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            json.dump(parsed_map, f, indent=2, ensure_ascii=False)
+        print(f"Exported section CSVs to: {Path(args.infile) / 'parsed_csvs'}")
+        return
+
+    if not args.infile:
+        ap.error('infile required (file path)')
+
     parsed = parse_file(args.infile)
     if args.out:
         with open(args.out, 'w', encoding='utf-8') as f:
@@ -296,3 +478,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+# %%
