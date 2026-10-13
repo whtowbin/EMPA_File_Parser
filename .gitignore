@@ -1,0 +1,11 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+
+# Virtual environments
+.venv
+
+# macOS, editor and Office temp files
+.DS_Store
+.ipynb_checkpoints/
+~$*

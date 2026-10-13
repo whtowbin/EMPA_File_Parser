@@ -1,6 +1,7 @@
 [project]
 name = "empa-file-parser"
 version = "0.1.0"
+description = "Parse electron microprobe (EPMA) run files into JSON or CSV, including standards and run conditions"
 requires-python = ">=3.13"
 dependencies = [
     "ipykernel>=6.30.1",
